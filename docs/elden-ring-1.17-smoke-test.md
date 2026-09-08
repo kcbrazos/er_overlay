@@ -1,4 +1,4 @@
-# ELDEN RING 1.17.0 Overlay Smoke Test
+# ELDEN RING 1.17.1 Overlay Smoke Test
 
 - [ ] Launch the game with the general `main` release package.
 - [ ] Confirm DX12 hook initialization and overlay rendering.
