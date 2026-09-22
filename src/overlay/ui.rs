@@ -8,7 +8,7 @@ use imgui::Ui;
 
 use crate::{
     RENDERER_INITIALIZED, debug_log,
-    ingest::{IngestStatus, ReporterController, SharedIngestStatus, create_status, status_line},
+    ingest::{IngestStatus, ReporterController, SharedIngestStatus, create_status, status_lines},
     overlay::{
         boss_panel::BossPanel,
         config::{ConfigManager, RuntimeConfig},
@@ -47,6 +47,11 @@ pub struct EROverlayUi {
     reporter: ReporterController,
 }
 
+/// Prepends the ingest status ahead of whatever `display_text` produced,
+/// rather than appending it after: Elden Battleship's own match clock and
+/// pace read as this feature's headline (see status_lines' doc comment),
+/// which only makes sense sitting above a player's own display_text lines
+/// (IGT, deaths, whatever they've configured), not below them.
 fn append_ingest_text(
     model: &mut OverlayViewModel,
     show_ingest_tally: bool,
@@ -56,8 +61,9 @@ fn append_ingest_text(
     if !show_ingest_tally {
         return None;
     }
-    if let Some(line) = status_line(status) {
-        model.lines.push(line);
+    let lines = status_lines(status);
+    if !lines.is_empty() {
+        model.lines.splice(0..0, lines);
     }
     show_expanded_error
         .then(|| status.last_error.clone())
@@ -425,7 +431,9 @@ mod tests {
                 misses: 4,
                 shots: 12,
                 accuracy: Some(67),
+                pace: None,
             }),
+            clock: None,
             warn: true,
             last_error: Some("server error".to_string()),
             kills_tracked: 2,
@@ -437,8 +445,11 @@ mod tests {
         assert_eq!(expanded_error, None);
     }
 
+    /// The ingest lines land BEFORE `display_text`'s own lines ("normal"
+    /// here) - see the doc comment on append_ingest_text - and split into
+    /// hit/miss and total/accuracy, with the failure marker on the last one.
     #[test]
-    fn ingest_text_includes_compact_line_and_expanded_error() {
+    fn ingest_text_includes_compact_lines_and_expanded_error() {
         let mut model = model();
         let status = IngestStatus {
             eligible: true,
@@ -447,7 +458,9 @@ mod tests {
                 misses: 4,
                 shots: 12,
                 accuracy: Some(67),
+                pace: None,
             }),
+            clock: None,
             warn: true,
             last_error: Some("server error".to_string()),
             kills_tracked: 2,
@@ -457,7 +470,7 @@ mod tests {
 
         assert_eq!(
             model.lines,
-            ["normal", "Hit 8   Miss 4   Total 12   Acc 67%   [!]"]
+            ["Hit 8   Miss 4", "Total 12   Acc 67%   [!]", "normal"]
         );
         assert_eq!(expanded_error.as_deref(), Some("server error"));
     }
@@ -468,6 +481,7 @@ mod tests {
         let status = IngestStatus {
             eligible: true,
             tally: Some(Tally::default()),
+            clock: None,
             warn: true,
             last_error: Some("server error".to_string()),
             kills_tracked: 2,
@@ -477,7 +491,7 @@ mod tests {
 
         assert_eq!(
             model.lines,
-            ["normal", "Hit 0   Miss 0   Total 0   Acc -   [!]"]
+            ["Hit 0   Miss 0", "Total 0   Acc -   [!]", "normal"]
         );
         assert_eq!(expanded_error, None);
     }
