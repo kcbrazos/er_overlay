@@ -171,6 +171,30 @@ pub struct Tally {
     /// whenever they got round to clicking it rather than the kill time.
     #[serde(default)]
     pub pace: Option<f64>,
+    /// Hulls this player has sunk this match. Older servers omit it, which
+    /// reads as 0.
+    #[serde(default)]
+    pub sunk: u32,
+}
+
+/// This player's best single past game on this board, as the server reports
+/// it. Rendered verbatim, like [`Tally`].
+///
+/// Every field is `Option` for the same reason [`Tally::accuracy`] is: a best
+/// that has not been set yet arrives as an explicit `null`, which
+/// `#[serde(default)]` alone would refuse.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct Pb {
+    #[serde(default)]
+    pub hits: Option<u32>,
+    #[serde(default)]
+    pub sunk: Option<u32>,
+    /// Whole percent.
+    #[serde(default)]
+    pub accuracy: Option<i32>,
+    /// Median seconds per square, lower is better. See [`Tally::pace`].
+    #[serde(default)]
+    pub pace: Option<f64>,
 }
 
 /// The phase Elden Battleship's own match clock is in. Mirrors the server's
@@ -239,6 +263,13 @@ pub struct IngestStatus {
     /// whenever `tally` would also be absent for the same reasons, plus the
     /// rare case of a live match with no start marker yet.
     pub clock: Option<ClockSnapshot>,
+    /// This player's personal bests on this board, as of the last reply.
+    /// `None` on a first game, on an older server, or when the server's PB
+    /// lookup failed, all of which mean no PB line.
+    pub pb: Option<Pb>,
+    /// Which stats the current match already beats, as decided by the server
+    /// (`"hits"`, `"sunk"`, `"accuracy"`, `"pace"`). Never recomputed here.
+    pub pb_beaten: Vec<String>,
     /// Last send failed, or was rejected for a reason outside [`INELIGIBLE`].
     /// Without this a stale tally looks identical to a live one.
     pub warn: bool,
@@ -285,6 +316,10 @@ struct IngestResponse {
     tally: Option<Tally>,
     #[serde(default, deserialize_with = "lenient_clock")]
     clock: Option<Clock>,
+    #[serde(default, deserialize_with = "lenient_pb")]
+    pb: Option<Pb>,
+    #[serde(default, deserialize_with = "lenient_beaten")]
+    pb_beaten: Vec<String>,
     #[serde(default)]
     fired: Vec<FiredEntry>,
     #[serde(default)]
@@ -338,6 +373,31 @@ where
 {
     let raw = serde_json::Value::deserialize(deserializer)?;
     Ok(serde_json::from_value::<Option<Clock>>(raw).ok().flatten())
+}
+
+/// Same leniency again, for the personal bests: a `pb` this build cannot read
+/// must cost us the PB line, never the report.
+///
+/// Objects only: serde will happily read a struct from an array, and an
+/// all-null PB from `[]` would draw a line of dashes where there should be none.
+fn lenient_pb<'de, D>(deserializer: D) -> Result<Option<Pb>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    if !raw.is_object() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<Pb>(raw).ok())
+}
+
+/// As [`lenient_pb`], falling back to an empty list: nothing marked beaten.
+fn lenient_beaten<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<Vec<String>>(raw).unwrap_or_default())
 }
 
 /// Result of one HTTP attempt, classified into what the caller should do next.
@@ -647,6 +707,8 @@ fn send_with_retry(
                     eligible: true,
                     tally: resp.tally,
                     clock,
+                    pb: resp.pb,
+                    pb_beaten: resp.pb_beaten,
                     warn: false,
                     last_error: None,
                     kills_tracked: first_seen.len(),
@@ -662,13 +724,16 @@ fn send_with_retry(
                     "reporting is not active for this match",
                 );
                 debug_log!("[automark] [ingest] idle: {_reason}");
-                // Wipe the tally and clock rather than leave the last match's
-                // numbers sitting on screen in a lobby this does not apply to.
+                // Wipe the tally, clock and PBs rather than leave the last
+                // match's numbers sitting on screen in a lobby this does not
+                // apply to.
                 let mut w = status.write().unwrap();
                 *w = IngestStatus {
                     eligible: false,
                     tally: None,
                     clock: None,
+                    pb: None,
+                    pb_beaten: Vec::new(),
                     warn: false,
                     last_error: None,
                     kills_tracked: first_seen.len(),
@@ -975,6 +1040,51 @@ fn pace_text(pace: Option<f64>) -> String {
         }
         None => "-".to_string(),
     }
+}
+
+/// "PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12": this player's best single past
+/// game on this board, drawn under the tally. Kept out of [`status_lines`] so
+/// it can be switched off on its own (`show_pb`).
+///
+/// `None` while warning, outside a supported match, with no tally, or when the
+/// server sent no `pb` (first game, older server, failed lookup).
+///
+/// A stat the server lists in `pb_beaten` shows the current match's value with
+/// ` NEW` after it instead of the old best. Which stats count as beaten is the
+/// server's call (thresholds, ties, which way is better) and is never
+/// recomputed here. ASCII only, for the same reason as [`hit_miss_line`].
+pub fn pb_line(status: &IngestStatus) -> Option<String> {
+    if status.warn || !status.eligible {
+        return None;
+    }
+    let t = status.tally.as_ref()?;
+    let pb = status.pb.as_ref()?;
+    let beaten = |stat: &str| status.pb_beaten.iter().any(|s| s == stat);
+
+    // The current value if this stat is beaten and we have one, else the best.
+    fn pick<T>(beaten: bool, current: Option<T>, best: Option<T>) -> (Option<T>, bool) {
+        match current {
+            Some(v) if beaten => (Some(v), true),
+            _ => (best, false),
+        }
+    }
+    let field = |value: Option<String>, new: bool| {
+        let text = value.unwrap_or_else(|| "-".to_string());
+        if new { format!("{text} NEW") } else { text }
+    };
+
+    let (hits, hits_new) = pick(beaten("hits"), Some(t.hits), pb.hits);
+    let (sunk, sunk_new) = pick(beaten("sunk"), Some(t.sunk), pb.sunk);
+    let (acc, acc_new) = pick(beaten("accuracy"), t.accuracy, pb.accuracy);
+    let (pace, pace_new) = pick(beaten("pace"), t.pace, pb.pace);
+
+    Some(format!(
+        "PB  Hit {}   Sunk {}   Acc {}   Pace {}",
+        field(hits.map(|v| v.to_string()), hits_new),
+        field(sunk.map(|v| v.to_string()), sunk_new),
+        field(acc.map(|v| format!("{v}%")), acc_new),
+        field(pace.map(|_| pace_text(pace)), pace_new),
+    ))
 }
 
 /// "Match: 47:37   Pace 2:23" , Elden Battleship's own headline: its match
@@ -1409,6 +1519,7 @@ mod tests {
                 shots: 12,
                 accuracy: Some(67),
                 pace: None,
+                sunk: 0,
             }),
             ..Default::default()
         };
@@ -1419,6 +1530,8 @@ mod tests {
             eligible: false,
             tally: None,
             clock: None,
+            pb: None,
+            pb_beaten: Vec::new(),
             warn: false,
             last_error: None,
             kills_tracked: s.kills_tracked,
@@ -1455,6 +1568,8 @@ mod tests {
             eligible: false,
             tally: None,
             clock: None,
+            pb: None,
+            pb_beaten: Vec::new(),
             warn: true,
             last_error: Some("ambiguous_match".into()),
             kills_tracked: 3,
@@ -1568,6 +1683,7 @@ mod tests {
                 shots: 12,
                 accuracy: Some(67),
                 pace: Some(154.0),
+                sunk: 0,
             }),
             clock: Some(ClockSnapshot {
                 clock: Clock { phase: ClockPhase::Match, seconds: 812, running: false },
@@ -1599,6 +1715,7 @@ mod tests {
                 shots: 12,
                 accuracy: Some(67),
                 pace: Some(154.0),
+                sunk: 0,
             }),
             clock: None,
             ..Default::default()
@@ -1636,6 +1753,7 @@ mod tests {
                 shots: 12,
                 accuracy: Some(67),
                 pace: None,
+                sunk: 0,
             }),
             warn: true,
             ..Default::default()
@@ -1843,6 +1961,192 @@ mod tests {
         assert_eq!(r.fired[0].flag, 31150800);
         assert_eq!(r.fired[0].cell, Some(28));
         assert_eq!(r.fired[0].result.as_deref(), Some("miss"));
+    }
+
+    /// A full reply carrying personal bests, in the shape the server sends.
+    const PB_REPLY: &str = r#"{"ok":true,"fired":[],"skipped":[],
+        "tally":{"hits":8,"misses":4,"shots":12,"accuracy":67,"pace":151.0,"sunk":2},
+        "pb":{"hits":19,"sunk":4,"accuracy":83,"pace":132},
+        "pb_beaten":["accuracy"],
+        "clock":{"phase":"match","seconds":2857,"running":true}}"#;
+
+    /// What the Accepted arm writes for a given reply.
+    fn accepted_status(r: IngestResponse) -> IngestStatus {
+        IngestStatus {
+            eligible: true,
+            tally: r.tally,
+            pb: r.pb,
+            pb_beaten: r.pb_beaten,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parses_pb_and_pb_beaten() {
+        let r: IngestResponse = serde_json::from_str(PB_REPLY).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.tally.unwrap().sunk, 2);
+        let pb = r.pb.expect("pb should parse");
+        assert_eq!(
+            (pb.hits, pb.sunk, pb.accuracy, pb.pace),
+            (Some(19), Some(4), Some(83), Some(132.0))
+        );
+        assert_eq!(r.pb_beaten, vec!["accuracy".to_string()]);
+        assert!(r.clock.is_some());
+    }
+
+    /// A best that has not been set yet arrives as `null`, not missing.
+    #[test]
+    fn parses_pb_with_null_fields() {
+        let raw = r#"{"ok":true,"tally":{"hits":1,"misses":0,"shots":1,"accuracy":100},
+            "pb":{"hits":19,"sunk":null,"accuracy":null,"pace":null}}"#;
+        let r: IngestResponse = serde_json::from_str(raw).expect("null PB fields must parse");
+        let pb = r.pb.expect("pb should survive nulls");
+        assert_eq!(
+            (pb.hits, pb.sunk, pb.accuracy, pb.pace),
+            (Some(19), None, None, None)
+        );
+        assert!(r.pb_beaten.is_empty());
+
+        let s = accepted_status(r);
+        assert_eq!(pb_line(&s).unwrap(), "PB  Hit 19   Sunk -   Acc -   Pace -");
+    }
+
+    /// No `pb` at all: first game, older server, or a failed lookup.
+    #[test]
+    fn no_pb_means_no_pb_line_and_unchanged_tally() {
+        let raw = r#"{"ok":true,"fired":[],"skipped":[],
+            "tally":{"hits":8,"misses":4,"shots":12,"accuracy":67}}"#;
+        let r: IngestResponse = serde_json::from_str(raw).unwrap();
+        assert!(r.pb.is_none());
+        assert!(r.pb_beaten.is_empty());
+
+        let s = accepted_status(r);
+        assert_eq!(pb_line(&s), None);
+        assert_eq!(
+            status_lines(&s),
+            vec![
+                "Hit 8   Miss 4".to_string(),
+                "Total 12   Acc 67%".to_string()
+            ]
+        );
+    }
+
+    /// A PB shape we do not understand must cost us the PB line, never the
+    /// report or the tally.
+    #[test]
+    fn an_unreadable_pb_does_not_sink_the_response() {
+        for weird in ["7", r#""x""#, "[]"] {
+            let raw = format!(
+                r#"{{"ok":true,"tally":{{"hits":8,"misses":4,"shots":12,"accuracy":67}},"pb":{weird},"pb_beaten":["hits"]}}"#
+            );
+            let r: IngestResponse =
+                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{weird} broke parsing: {e}"));
+            assert!(r.ok, "{weird} should still be a successful report");
+            assert!(r.tally.is_some(), "{weird} must not cost the tally");
+            assert!(r.pb.is_none(), "{weird} should degrade to no pb");
+            assert_eq!(
+                pb_line(&accepted_status(r)),
+                None,
+                "{weird} should draw no PB line"
+            );
+        }
+
+        let raw = r#"{"ok":true,"tally":{"hits":8,"misses":4,"shots":12,"accuracy":67},
+            "pb":{"hits":19,"sunk":4,"accuracy":83,"pace":132},"pb_beaten":3}"#;
+        let r: IngestResponse = serde_json::from_str(raw).expect("bad pb_beaten must not sink it");
+        assert!(r.ok);
+        assert!(r.tally.is_some());
+        assert!(r.pb.is_some());
+        assert!(
+            r.pb_beaten.is_empty(),
+            "bad pb_beaten should degrade to nothing beaten"
+        );
+    }
+
+    #[test]
+    fn pb_line_renders_bests_and_marks_beaten_stats() {
+        let mut r: IngestResponse = serde_json::from_str(PB_REPLY).unwrap();
+        r.pb_beaten.clear();
+        let mut s = accepted_status(r);
+        assert_eq!(
+            pb_line(&s).unwrap(),
+            "PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12"
+        );
+
+        // Accuracy beaten: the current 91% shows, marked NEW; the rest stay bests.
+        s.tally.as_mut().unwrap().accuracy = Some(91);
+        s.pb_beaten = vec!["accuracy".to_string()];
+        assert_eq!(
+            pb_line(&s).unwrap(),
+            "PB  Hit 19   Sunk 4   Acc 91% NEW   Pace 2:12"
+        );
+    }
+
+    /// A beaten stat with no current value falls back to the best, unmarked.
+    #[test]
+    fn pb_line_falls_back_when_a_beaten_value_is_missing() {
+        let mut s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
+        s.tally.as_mut().unwrap().pace = None;
+        s.pb_beaten = vec!["pace".to_string()];
+        assert_eq!(
+            pb_line(&s).unwrap(),
+            "PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12"
+        );
+    }
+
+    #[test]
+    fn pb_line_hidden_while_warning_or_ineligible() {
+        let s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
+        assert!(pb_line(&s).is_some());
+
+        let warning = IngestStatus {
+            warn: true,
+            ..s.clone()
+        };
+        assert_eq!(pb_line(&warning), None);
+
+        let ineligible = IngestStatus {
+            eligible: false,
+            ..s.clone()
+        };
+        assert_eq!(pb_line(&ineligible), None);
+
+        let no_tally = IngestStatus { tally: None, ..s };
+        assert_eq!(pb_line(&no_tally), None);
+    }
+
+    #[test]
+    fn pb_line_is_ascii() {
+        let mut s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
+        s.pb_beaten = ["hits", "sunk", "accuracy", "pace"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        let line = pb_line(&s).unwrap();
+        assert!(
+            line.is_ascii(),
+            "PB line must render in the embedded font: {line}"
+        );
+        assert_eq!(
+            line,
+            "PB  Hit 8 NEW   Sunk 2 NEW   Acc 67% NEW   Pace 2:31 NEW"
+        );
+    }
+
+    #[test]
+    fn tally_sunk_defaults_to_zero_when_absent() {
+        let r: IngestResponse = serde_json::from_str(
+            r#"{"ok":true,"tally":{"hits":8,"misses":4,"shots":12,"accuracy":67}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.tally.unwrap().sunk, 0);
+
+        let r: IngestResponse = serde_json::from_str(
+            r#"{"ok":true,"tally":{"hits":8,"misses":4,"shots":12,"accuracy":67,"sunk":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.tally.unwrap().sunk, 3);
     }
 
     fn manual_attempt_class(attempt: &Attempt) -> &'static str {

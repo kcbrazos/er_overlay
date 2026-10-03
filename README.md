@@ -70,6 +70,17 @@ Hit 8   Miss 4   Total 12   Acc 67%
 reason below the normal overlay lines. Set `show_ingest_tally = false` under
 `[overlay]` to hide both status messages.
 
+When the server also sends this player's personal bests for the board, a line
+under the tally shows them:
+
+```text
+PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12
+```
+
+A best not set yet shows as `-`. A stat the current match already beats (the
+server decides which) shows the current value followed by `NEW`. Nothing needs
+configuring; set `show_pb = false` under `[overlay]` to hide just this line.
+
 ## Victory conditions
 
 Victory tracking is disabled by default:
