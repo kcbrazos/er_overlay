@@ -189,6 +189,9 @@ pub struct Pb {
     pub hits: Option<u32>,
     #[serde(default)]
     pub sunk: Option<u32>,
+    /// Most shots taken in one game. Older servers omit it.
+    #[serde(default)]
+    pub shots: Option<u32>,
     /// Whole percent.
     #[serde(default)]
     pub accuracy: Option<i32>,
@@ -1021,13 +1024,16 @@ fn hit_miss_line(t: &Tally) -> String {
 }
 
 fn total_acc_line(t: &Tally) -> String {
-    // A dash whenever there is no percentage to state: before the first shot the
-    // server sends null, and nothing has missed yet, so `0%` would be a lie.
-    let acc = match t.accuracy {
+    format!("Total {}   Acc {}", t.shots, acc_text(t))
+}
+
+/// "67%", or a dash whenever there is no percentage to state: before the first
+/// shot the server sends null, and nothing has missed yet, so `0%` would be a lie.
+fn acc_text(t: &Tally) -> String {
+    match t.accuracy {
         Some(pct) if t.shots > 0 => format!("{pct}%"),
         _ => "-".to_string(),
-    };
-    format!("Total {}   Acc {}", t.shots, acc)
+    }
 }
 
 /// "2:34", or a dash before there have been enough auto-fired squares in a row
@@ -1042,49 +1048,118 @@ fn pace_text(pace: Option<f64>) -> String {
     }
 }
 
-/// "PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12": this player's best single past
-/// game on this board, drawn under the tally. Kept out of [`status_lines`] so
-/// it can be switched off on its own (`show_pb`).
+/// [`status_lines`] with this player's personal bests beside the stats they
+/// belong to, plus a Sunk row:
 ///
-/// `None` while warning, outside a supported match, with no tally, or when the
-/// server sent no `pb` (first game, older server, failed lookup).
+/// ```text
+/// Prep: 3:25   Pace -  (2:23)
+/// Hit 0   Miss 0  (27)
+/// Total 0  (40)   Acc -  (71%)
+/// Sunk 0  (4)
+/// ```
 ///
-/// A stat the server lists in `pb_beaten` shows the current match's value with
-/// ` NEW` after it instead of the old best. Which stats count as beaten is the
-/// server's call (thresholds, ties, which way is better) and is never
-/// recomputed here. ASCII only, for the same reason as [`hit_miss_line`].
-pub fn pb_line(status: &IngestStatus) -> Option<String> {
-    if status.warn || !status.eligible {
-        return None;
+/// Bests ride on the existing lines rather than a PB line of their own, so no
+/// one line ends up far wider than the rest and the panel stays tight.
+///
+/// Falls back to exactly [`status_lines`] whenever [`shows_bests`] is false. A
+/// best that has not been set yet gets no brackets.
+///
+/// A stat the server lists in `pb_beaten` shows `(NEW)` instead of the old best,
+/// since the current value is already on the line. Which stats count as beaten
+/// is the server's call (thresholds, ties, which way is better) and is never
+/// recomputed here; if a beaten stat has no current value, the old best shows
+/// instead. ASCII only, for the same reason as [`hit_miss_line`].
+pub fn status_lines_with_pb(status: &IngestStatus) -> Vec<String> {
+    if !shows_bests(status) {
+        return status_lines(status);
     }
-    let t = status.tally.as_ref()?;
-    let pb = status.pb.as_ref()?;
+    let (Some(t), Some(pb)) = (&status.tally, &status.pb) else {
+        return status_lines(status);
+    };
     let beaten = |stat: &str| status.pb_beaten.iter().any(|s| s == stat);
-
-    // The current value if this stat is beaten and we have one, else the best.
-    fn pick<T>(beaten: bool, current: Option<T>, best: Option<T>) -> (Option<T>, bool) {
-        match current {
-            Some(v) if beaten => (Some(v), true),
-            _ => (best, false),
+    let mark = |line: String, stat: &str, has_current: bool, best: Option<String>| {
+        if beaten(stat) && has_current {
+            format!("{line}  (NEW)")
+        } else if let Some(best) = best {
+            format!("{line}  ({best})")
+        } else {
+            line
         }
-    }
-    let field = |value: Option<String>, new: bool| {
-        let text = value.unwrap_or_else(|| "-".to_string());
-        if new { format!("{text} NEW") } else { text }
     };
 
-    let (hits, hits_new) = pick(beaten("hits"), Some(t.hits), pb.hits);
-    let (sunk, sunk_new) = pick(beaten("sunk"), Some(t.sunk), pb.sunk);
-    let (acc, acc_new) = pick(beaten("accuracy"), t.accuracy, pb.accuracy);
-    let (pace, pace_new) = pick(beaten("pace"), t.pace, pb.pace);
+    let mut lines = Vec::with_capacity(4);
+    if let Some(clock) = &status.clock {
+        lines.push(mark(
+            clock_pace_line(clock, t.pace),
+            "pace",
+            t.pace.is_some(),
+            pb.pace.map(|p| pace_text(Some(p))),
+        ));
+    }
+    lines.push(mark(
+        hit_miss_line(t),
+        "hits",
+        true,
+        pb.hits.map(|v| v.to_string()),
+    ));
+    // Two stats on one line, each with its own best.
+    let total = mark(
+        format!("Total {}", t.shots),
+        "shots",
+        true,
+        pb.shots.map(|v| v.to_string()),
+    );
+    let acc = mark(
+        format!("Acc {}", acc_text(t)),
+        "accuracy",
+        t.accuracy.is_some() && t.shots > 0,
+        pb.accuracy.map(|v| format!("{v}%")),
+    );
+    lines.push(format!("{total}   {acc}"));
+    lines.push(mark(
+        format!("Sunk {}", t.sunk),
+        "sunk",
+        true,
+        pb.sunk.map(|v| v.to_string()),
+    ));
+    lines
+}
 
-    Some(format!(
-        "PB  Hit {}   Sunk {}   Acc {}   Pace {}",
-        field(hits.map(|v| v.to_string()), hits_new),
-        field(sunk.map(|v| v.to_string()), sunk_new),
-        field(acc.map(|v| format!("{v}%")), acc_new),
-        field(pace.map(|_| pace_text(pace)), pace_new),
-    ))
+/// Whether [`status_lines_with_pb`] will draw bests (and so its Sunk row):
+/// not while warning, not outside a supported match, and only with both a
+/// tally and a `pb` (absent on a first game, an older server, or a failed
+/// lookup).
+pub fn shows_bests(status: &IngestStatus) -> bool {
+    !status.warn && status.eligible && status.tally.is_some() && status.pb.is_some()
+}
+
+/// Everything the overlay draws: the ingest lines first, then `display_text`'s.
+///
+/// When bests are showing and `display_text` is a single line (Elden
+/// Battleship's setup ships `Deaths: {deaths}`), that line goes on the end of
+/// the Sunk row instead of taking a row of its own, "Sunk 0  (4)   Deaths: 0",
+/// so the panel is one line shorter. A multi-line `display_text` is left alone:
+/// there is no telling which of its lines would read sensibly beside Sunk.
+pub fn combine_with_display_text(
+    status: &IngestStatus,
+    show_pb: bool,
+    display: Vec<String>,
+) -> Vec<String> {
+    let mut lines = if show_pb {
+        status_lines_with_pb(status)
+    } else {
+        status_lines(status)
+    };
+    let joins_sunk_row =
+        show_pb && shows_bests(status) && display.len() == 1 && !display[0].trim().is_empty();
+    match lines.last_mut() {
+        Some(sunk_row) if joins_sunk_row => {
+            sunk_row.push_str("   ");
+            sunk_row.push_str(display[0].trim());
+        }
+        _ => lines.extend(display),
+    }
+    lines
 }
 
 /// "Match: 47:37   Pace 2:23" , Elden Battleship's own headline: its match
@@ -2008,8 +2083,16 @@ mod tests {
         );
         assert!(r.pb_beaten.is_empty());
 
+        // Only hits has a best, so only hits gets brackets.
         let s = accepted_status(r);
-        assert_eq!(pb_line(&s).unwrap(), "PB  Hit 19   Sunk -   Acc -   Pace -");
+        assert_eq!(
+            status_lines_with_pb(&s),
+            vec![
+                "Hit 1   Miss 0  (19)".to_string(),
+                "Total 1   Acc 100%".to_string(),
+                "Sunk 0".to_string(),
+            ]
+        );
     }
 
     /// No `pb` at all: first game, older server, or a failed lookup.
@@ -2022,9 +2105,8 @@ mod tests {
         assert!(r.pb_beaten.is_empty());
 
         let s = accepted_status(r);
-        assert_eq!(pb_line(&s), None);
         assert_eq!(
-            status_lines(&s),
+            status_lines_with_pb(&s),
             vec![
                 "Hit 8   Miss 4".to_string(),
                 "Total 12   Acc 67%".to_string()
@@ -2045,10 +2127,11 @@ mod tests {
             assert!(r.ok, "{weird} should still be a successful report");
             assert!(r.tally.is_some(), "{weird} must not cost the tally");
             assert!(r.pb.is_none(), "{weird} should degrade to no pb");
+            let s = accepted_status(r);
             assert_eq!(
-                pb_line(&accepted_status(r)),
-                None,
-                "{weird} should draw no PB line"
+                status_lines_with_pb(&s),
+                status_lines(&s),
+                "{weird} should add no bests"
             );
         }
 
@@ -2064,74 +2147,180 @@ mod tests {
         );
     }
 
+    /// The PB reply with a stopped clock attached, so the clock line is stable.
+    fn pb_status_with_clock() -> IngestStatus {
+        IngestStatus {
+            clock: Some(ClockSnapshot {
+                clock: Clock {
+                    phase: ClockPhase::Match,
+                    seconds: 812,
+                    running: false,
+                },
+                received_at: Instant::now(),
+            }),
+            ..accepted_status(serde_json::from_str(PB_REPLY).unwrap())
+        }
+    }
+
+    /// Each best sits in brackets beside its own stat, with Sunk on a row of
+    /// its own, rather than one long PB line that widens the whole panel.
     #[test]
-    fn pb_line_renders_bests_and_marks_beaten_stats() {
-        let mut r: IngestResponse = serde_json::from_str(PB_REPLY).unwrap();
-        r.pb_beaten.clear();
-        let mut s = accepted_status(r);
+    fn bests_sit_beside_their_stats() {
+        let mut s = pb_status_with_clock();
+        s.pb_beaten.clear();
         assert_eq!(
-            pb_line(&s).unwrap(),
-            "PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12"
+            status_lines_with_pb(&s),
+            vec![
+                "Match: 13:32   Pace 2:31  (2:12)".to_string(),
+                "Hit 8   Miss 4  (19)".to_string(),
+                "Total 12   Acc 67%  (83%)".to_string(),
+                "Sunk 2  (4)".to_string(),
+            ]
         );
 
-        // Accuracy beaten: the current 91% shows, marked NEW; the rest stay bests.
-        s.tally.as_mut().unwrap().accuracy = Some(91);
+        // Accuracy beaten: its best is replaced by NEW, the others are untouched.
         s.pb_beaten = vec!["accuracy".to_string()];
+        assert_eq!(status_lines_with_pb(&s)[2], "Total 12   Acc 67%  (NEW)");
+    }
+
+    /// A shots best sits beside Total, its own bracket separate from accuracy's.
+    #[test]
+    fn shots_best_sits_beside_total() {
+        let raw = r#"{"ok":true,
+            "tally":{"hits":8,"misses":4,"shots":12,"accuracy":67},
+            "pb":{"hits":19,"sunk":4,"shots":40,"accuracy":83,"pace":132}}"#;
+        let r: IngestResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.pb.unwrap().shots, Some(40));
+
+        let mut s = accepted_status(r);
         assert_eq!(
-            pb_line(&s).unwrap(),
-            "PB  Hit 19   Sunk 4   Acc 91% NEW   Pace 2:12"
+            status_lines_with_pb(&s)[1],
+            "Total 12  (40)   Acc 67%  (83%)"
+        );
+
+        s.pb_beaten = vec!["shots".to_string()];
+        assert_eq!(
+            status_lines_with_pb(&s)[1],
+            "Total 12  (NEW)   Acc 67%  (83%)"
+        );
+    }
+
+    /// A one-line `display_text` (Elden Battleship ships "Deaths") joins the
+    /// Sunk row.
+    #[test]
+    fn single_display_line_joins_the_sunk_row() {
+        let mut s = pb_status_with_clock();
+        s.pb_beaten.clear();
+        assert_eq!(
+            combine_with_display_text(&s, true, vec!["Deaths: 0".to_string()]),
+            vec![
+                "Match: 13:32   Pace 2:31  (2:12)".to_string(),
+                "Hit 8   Miss 4  (19)".to_string(),
+                "Total 12   Acc 67%  (83%)".to_string(),
+                "Sunk 2  (4)   Deaths: 0".to_string(),
+            ]
+        );
+    }
+
+    /// Several display lines, no bests, or bests switched off: nothing joins,
+    /// display_text keeps its own rows under the ingest lines.
+    #[test]
+    fn display_text_keeps_its_own_rows_otherwise() {
+        let mut s = pb_status_with_clock();
+        s.pb_beaten.clear();
+        let multi = vec!["IGT: 1:00:00".to_string(), "Deaths: 3".to_string()];
+        let combined = combine_with_display_text(&s, true, multi.clone());
+        assert_eq!(combined[3], "Sunk 2  (4)");
+        assert_eq!(combined[4..], multi[..]);
+
+        let deaths = vec!["Deaths: 0".to_string()];
+        let off = combine_with_display_text(&s, false, deaths.clone());
+        assert_eq!(off.last(), Some(&"Deaths: 0".to_string()));
+        assert_eq!(off.len(), status_lines(&s).len() + 1);
+
+        let no_pb = IngestStatus {
+            pb: None,
+            ..s.clone()
+        };
+        let plain = combine_with_display_text(&no_pb, true, deaths.clone());
+        assert_eq!(plain.last(), Some(&"Deaths: 0".to_string()));
+        assert_eq!(plain.len(), status_lines(&no_pb).len() + 1);
+
+        // Nothing from ingest at all (idle lobby): just display_text.
+        let idle = IngestStatus::default();
+        assert_eq!(
+            combine_with_display_text(&idle, true, deaths.clone()),
+            deaths
+        );
+    }
+
+    /// No clock means no clock line, so the pace best has nowhere to go, the
+    /// same rule as pace itself, which only shows next to its clock.
+    #[test]
+    fn bests_without_a_clock_drop_the_pace_best() {
+        let mut s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
+        s.pb_beaten.clear();
+        assert_eq!(
+            status_lines_with_pb(&s),
+            vec![
+                "Hit 8   Miss 4  (19)".to_string(),
+                "Total 12   Acc 67%  (83%)".to_string(),
+                "Sunk 2  (4)".to_string(),
+            ]
         );
     }
 
     /// A beaten stat with no current value falls back to the best, unmarked.
     #[test]
-    fn pb_line_falls_back_when_a_beaten_value_is_missing() {
-        let mut s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
+    fn beaten_stat_without_a_current_value_shows_the_best() {
+        let mut s = pb_status_with_clock();
         s.tally.as_mut().unwrap().pace = None;
         s.pb_beaten = vec!["pace".to_string()];
-        assert_eq!(
-            pb_line(&s).unwrap(),
-            "PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12"
-        );
+        assert_eq!(status_lines_with_pb(&s)[0], "Match: 13:32   Pace -  (2:12)");
     }
 
+    /// Warning, ineligible or tally-less: exactly the plain lines, no bests.
     #[test]
-    fn pb_line_hidden_while_warning_or_ineligible() {
-        let s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
-        assert!(pb_line(&s).is_some());
+    fn bests_hidden_while_warning_or_ineligible() {
+        let s = pb_status_with_clock();
+        assert_ne!(status_lines_with_pb(&s), status_lines(&s));
 
         let warning = IngestStatus {
             warn: true,
             ..s.clone()
         };
-        assert_eq!(pb_line(&warning), None);
+        assert_eq!(status_lines_with_pb(&warning), status_lines(&warning));
 
         let ineligible = IngestStatus {
             eligible: false,
             ..s.clone()
         };
-        assert_eq!(pb_line(&ineligible), None);
+        assert_eq!(status_lines_with_pb(&ineligible), status_lines(&ineligible));
 
         let no_tally = IngestStatus { tally: None, ..s };
-        assert_eq!(pb_line(&no_tally), None);
+        assert_eq!(status_lines_with_pb(&no_tally), status_lines(&no_tally));
     }
 
     #[test]
-    fn pb_line_is_ascii() {
-        let mut s = accepted_status(serde_json::from_str(PB_REPLY).unwrap());
+    fn lines_with_bests_are_ascii() {
+        let mut s = pb_status_with_clock();
         s.pb_beaten = ["hits", "sunk", "accuracy", "pace"]
             .iter()
             .map(|x| x.to_string())
             .collect();
-        let line = pb_line(&s).unwrap();
-        assert!(
-            line.is_ascii(),
-            "PB line must render in the embedded font: {line}"
-        );
+        let lines = status_lines_with_pb(&s);
         assert_eq!(
-            line,
-            "PB  Hit 8 NEW   Sunk 2 NEW   Acc 67% NEW   Pace 2:31 NEW"
+            lines,
+            vec![
+                "Match: 13:32   Pace 2:31  (NEW)".to_string(),
+                "Hit 8   Miss 4  (NEW)".to_string(),
+                "Total 12   Acc 67%  (NEW)".to_string(),
+                "Sunk 2  (NEW)".to_string(),
+            ]
         );
+        for line in &lines {
+            assert!(line.is_ascii(), "must render in the embedded font: {line}");
+        }
     }
 
     #[test]

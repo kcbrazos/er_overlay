@@ -9,7 +9,8 @@ use imgui::Ui;
 use crate::{
     RENDERER_INITIALIZED, debug_log,
     ingest::{
-        IngestStatus, ReporterController, SharedIngestStatus, create_status, pb_line, status_lines,
+        IngestStatus, ReporterController, SharedIngestStatus, combine_with_display_text,
+        create_status,
     },
     overlay::{
         boss_panel::BossPanel,
@@ -53,8 +54,9 @@ pub struct EROverlayUi {
 /// rather than appending it after: Elden Battleship's own match clock and
 /// pace read as this feature's headline (see status_lines' doc comment),
 /// which only makes sense sitting above a player's own display_text lines
-/// (IGT, deaths, whatever they've configured), not below them. The personal-
-/// best line, when there is one, sits directly under the tally lines.
+/// (IGT, deaths, whatever they've configured), not below them. Personal
+/// bests ride beside the stats they belong to, and a one-line display_text
+/// can join the Sunk row (see combine_with_display_text).
 fn append_ingest_text(
     model: &mut OverlayViewModel,
     show_ingest_tally: bool,
@@ -65,13 +67,8 @@ fn append_ingest_text(
     if !show_ingest_tally {
         return None;
     }
-    let mut lines = status_lines(status);
-    if show_pb && let Some(pb) = pb_line(status) {
-        lines.push(pb);
-    }
-    if !lines.is_empty() {
-        model.lines.splice(0..0, lines);
-    }
+    let display = std::mem::take(&mut model.lines);
+    model.lines = combine_with_display_text(status, show_pb, display);
     show_expanded_error
         .then(|| status.last_error.clone())
         .flatten()
@@ -518,10 +515,10 @@ mod tests {
         assert_eq!(expanded_error, None);
     }
 
-    /// The PB line sits directly under the tally lines and above
-    /// `display_text`'s own, and `show_pb = false` drops only that line.
+    /// Bests sit beside their stats, a one-line `display_text` ("normal" here)
+    /// joins the Sunk row, and `show_pb = false` puts everything back as it was.
     #[test]
-    fn pb_line_follows_the_tally_and_can_be_switched_off() {
+    fn bests_sit_beside_the_tally_and_can_be_switched_off() {
         let status = IngestStatus {
             eligible: true,
             tally: Some(Tally {
@@ -535,6 +532,7 @@ mod tests {
             pb: Some(Pb {
                 hits: Some(19),
                 sunk: Some(4),
+                shots: Some(40),
                 accuracy: Some(83),
                 pace: Some(132.0),
             }),
@@ -546,10 +544,9 @@ mod tests {
         assert_eq!(
             shown.lines,
             [
-                "Hit 8   Miss 4",
-                "Total 12   Acc 67%",
-                "PB  Hit 19   Sunk 4   Acc 83%   Pace 2:12",
-                "normal",
+                "Hit 8   Miss 4  (19)",
+                "Total 12  (40)   Acc 67%  (83%)",
+                "Sunk 2  (4)   normal",
             ]
         );
 
