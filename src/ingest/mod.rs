@@ -41,13 +41,22 @@ use crate::overlay::game_monitor::MonitorObservation;
 use crate::{debug_log, overlay::style::Ingest, util::time::rfc3339_millis_utc};
 
 /// Wall-clock budget for one request, DNS through response body.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Generous on purpose. The server writes the shot before it builds its reply,
+/// so a slow reply is almost always a kill that already landed. A tight budget
+/// turned those into "failures" and sent the worker into a backoff chain, which
+/// is what held a kill made during it back by up to half a minute.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Backoff schedule is `1s, 2s, 4s, …` capped at [`BACKOFF_CAP`].
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Attempts per send before giving up. The kill set is retained either way and
 /// rides along on the next send, so giving up costs a delay, not data.
 const MAX_ATTEMPTS: u32 = 5;
+/// How soon to try again after a send gave up with nothing delivered. Sooner
+/// than the heartbeat, so a kill caught in an outage is not held for a whole
+/// one, but slow enough not to hammer a server that is down.
+const UNDELIVERED_RETRY: Duration = Duration::from_secs(15);
 /// Upper bound on how long the worker sleeps before re-checking the stop flag.
 const TICK: Duration = Duration::from_millis(200);
 /// Reporter responses are small JSON documents. This cap prevents a remote
@@ -563,6 +572,10 @@ fn run(
     let mut unsent = false;
     let mut have_snapshot = false;
     let mut last_send: Option<Instant> = None;
+    // When the last send gave up without the server ever answering, measured
+    // from when it gave up - a backoff chain can outlast `interval` many times
+    // over, so timing this from the start would retry straight away.
+    let mut undelivered_since: Option<Instant> = None;
 
     while !stop.load(Ordering::SeqCst) {
         // Absorb everything queued, then block briefly so the stop flag stays
@@ -600,18 +613,20 @@ fn run(
             last_send.map(|sent| sent.elapsed()),
             settings.interval,
             settings.heartbeat,
-        );
+        ) || undelivered_since
+            .is_some_and(|failed| failed.elapsed() >= UNDELIVERED_RETRY);
         if !due {
             continue;
         }
 
         last_send = Some(Instant::now());
         // Cleared before sending, not after: on failure the kills stay in the
-        // local set and ride along on the next heartbeat rather than retrying
-        // every `interval`.
+        // local set and ride along on the next send rather than retrying every
+        // `interval` - `UNDELIVERED_RETRY` decides when that is.
         unsent = false;
 
-        send_with_retry(&agent, &settings, &first_seen, &status, &stop);
+        let settled = send_with_retry(&agent, &settings, &mut first_seen, &rx, &status, &stop);
+        undelivered_since = (!settled).then(Instant::now);
     }
 
     debug_log!("[automark] [ingest] worker exiting");
@@ -673,30 +688,41 @@ fn build_agent() -> ureq::Agent {
     config.into()
 }
 
+/// Sends the kill set, retrying transient failures with backoff.
+///
+/// Returns true once the server has answered either way (accepted, ineligible
+/// or rejected) and false when it gave up without an answer, which is the only
+/// case worth trying again soon.
+///
+/// The body is rebuilt for every attempt, and the backoff waits keep absorbing
+/// monitor snapshots: a kill made while this is retrying goes out on the very
+/// next attempt, and cuts the wait before it short, rather than queueing behind
+/// the whole chain.
 fn send_with_retry(
     agent: &ureq::Agent,
     settings: &IngestSettings,
-    first_seen: &BTreeMap<i32, SystemTime>,
+    first_seen: &mut BTreeMap<i32, SystemTime>,
+    rx: &Receiver<MonitorObservation>,
     status: &SharedIngestStatus,
     stop: &Arc<AtomicBool>,
-) {
-    let body = match build_body(&settings.token, first_seen) {
-        Ok(body) => body,
-        Err(e) => {
-            // Serialising our own struct should not fail; if it somehow does,
-            // there is nothing to retry.
-            debug_log!("[automark] [ingest] ❌ could not serialise payload: {e}");
-            set_warn(status, first_seen.len(), &format!("payload error: {e}"));
-            return;
-        }
-    };
-
+) -> bool {
     let mut backoff = BACKOFF_START;
 
     for attempt in 1..=MAX_ATTEMPTS {
         if stop.load(Ordering::SeqCst) {
-            return;
+            return true;
         }
+
+        let body = match build_body(&settings.token, first_seen) {
+            Ok(body) => body,
+            Err(e) => {
+                // Serialising our own struct should not fail; if it somehow
+                // does, there is nothing to retry.
+                debug_log!("[automark] [ingest] ❌ could not serialise payload: {e}");
+                set_warn(status, first_seen.len(), &format!("payload error: {e}"));
+                return true;
+            }
+        };
 
         match send_once(agent, &settings.url, &body) {
             Attempt::Accepted(resp) => {
@@ -716,7 +742,7 @@ fn send_with_retry(
                     last_error: None,
                     kills_tracked: first_seen.len(),
                 };
-                return;
+                return true;
             }
             // Underscored so release builds, where `debug_log!` compiles away,
             // do not see it as unused.
@@ -741,13 +767,13 @@ fn send_with_retry(
                     last_error: None,
                     kills_tracked: first_seen.len(),
                 };
-                return;
+                return true;
             }
             Attempt::Rejected(error) => {
                 let error = safe_external_diagnostic(&error, settings, "report rejected");
                 debug_log!("[automark] [ingest] ❌ rejected: {error}");
                 set_warn(status, first_seen.len(), &error);
-                return;
+                return true;
             }
             Attempt::Retryable(error) => {
                 let error = safe_external_diagnostic(&error, settings, "report failed");
@@ -757,16 +783,70 @@ fn send_with_retry(
                          , kills retained for the next send"
                     );
                     set_warn(status, first_seen.len(), &error);
-                    return;
+                    return false;
                 }
                 debug_log!(
                     "[automark] [ingest] ⚠ attempt {attempt} failed ({error}); retrying in {}s",
                     backoff.as_secs()
                 );
-                if !sleep_interruptible(backoff, stop) {
-                    return;
+                match backoff_wait(backoff, rx, first_seen, stop) {
+                    BackoffEnd::Stopped => return true,
+                    BackoffEnd::NewKill => {
+                        debug_log!("[automark] [ingest] new kill during backoff; retrying now");
+                    }
+                    BackoffEnd::Elapsed => {}
                 }
                 backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+        }
+    }
+    false
+}
+
+/// How a backoff wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum BackoffEnd {
+    Elapsed,
+    /// A snapshot carried a flag never seen before; retry without waiting.
+    NewKill,
+    Stopped,
+}
+
+/// Waits out one backoff step, folding in monitor snapshots as they arrive.
+///
+/// Ends early on a new kill, so it goes out on the next attempt instead of
+/// after the rest of the chain. Snapshots that bring nothing new are absorbed
+/// without ending the wait.
+fn backoff_wait(
+    total: Duration,
+    rx: &Receiver<MonitorObservation>,
+    first_seen: &mut BTreeMap<i32, SystemTime>,
+    stop: &Arc<AtomicBool>,
+) -> BackoffEnd {
+    let deadline = Instant::now() + total;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return BackoffEnd::Stopped;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return BackoffEnd::Elapsed;
+        }
+        match rx.recv_timeout(TICK.min(remaining)) {
+            Ok(snap) => {
+                if merge(first_seen, snap) {
+                    return BackoffEnd::NewKill;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // No more snapshots can come; sit out the rest without spinning.
+            // The main loop notices the disconnect once this send finishes.
+            Err(RecvTimeoutError::Disconnected) => {
+                return if sleep_interruptible(remaining, stop) {
+                    BackoffEnd::Elapsed
+                } else {
+                    BackoffEnd::Stopped
+                };
             }
         }
     }
@@ -1223,6 +1303,64 @@ mod tests {
         ));
         assert_eq!(seen[&1], t0);
         assert_eq!(seen[&2], t0);
+    }
+
+    fn observation(flags: Vec<i32>) -> MonitorObservation {
+        MonitorObservation {
+            active_boss_flags: flags,
+            observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+        }
+    }
+
+    #[test]
+    fn backoff_wait_ends_early_on_a_new_kill() {
+        let (tx, rx) = unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut seen = BTreeMap::new();
+        merge(&mut seen, observation(vec![1]));
+
+        // Already known, then new: the first is absorbed, the second ends it.
+        tx.send(observation(vec![1])).unwrap();
+        tx.send(observation(vec![1, 2])).unwrap();
+
+        let started = Instant::now();
+        let end = backoff_wait(Duration::from_secs(30), &rx, &mut seen, &stop);
+        assert_eq!(end, BackoffEnd::NewKill);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(seen.contains_key(&2));
+    }
+
+    #[test]
+    fn backoff_wait_sits_out_snapshots_with_nothing_new() {
+        let (tx, rx) = unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut seen = BTreeMap::new();
+        merge(&mut seen, observation(vec![1]));
+        tx.send(observation(vec![1])).unwrap();
+
+        let end = backoff_wait(Duration::from_millis(300), &rx, &mut seen, &stop);
+        assert_eq!(end, BackoffEnd::Elapsed);
+    }
+
+    #[test]
+    fn backoff_wait_honours_stop_and_disconnect() {
+        let (tx, rx) = unbounded::<MonitorObservation>();
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut seen = BTreeMap::new();
+        assert_eq!(
+            backoff_wait(Duration::from_secs(30), &rx, &mut seen, &stop),
+            BackoffEnd::Stopped
+        );
+
+        // A dropped monitor must not turn the wait into a spin.
+        drop(tx);
+        stop.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        assert_eq!(
+            backoff_wait(Duration::from_millis(300), &rx, &mut seen, &stop),
+            BackoffEnd::Elapsed
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
     }
 
     fn settings(url: &str, token: &str) -> Option<IngestSettings> {
