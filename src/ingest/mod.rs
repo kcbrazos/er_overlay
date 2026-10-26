@@ -247,19 +247,49 @@ pub struct ClockSnapshot {
     pub received_at: Instant,
 }
 
-/// The clock's live value right now, extrapolated from the last reply.
+/// The clock's live phase and value right now, extrapolated from the last
+/// reply.
+///
+/// PREPARATION rolls straight over into MATCH when it runs out, counting up
+/// from there, because what follows it is never in doubt. Holding "Prep 0:00"
+/// until the next reply , up to a whole `heartbeat` away , read as a frozen
+/// clock to players waiting on it to start, and they went late. STARTING
+/// cannot do the same: how long PREPARATION lasts is the room's setting, which
+/// the reply does not carry, so it holds at 0 and the worker asks the server
+/// straight away instead , see [`countdown_expired`].
+pub fn clock_reading(snapshot: &ClockSnapshot) -> (ClockPhase, u32) {
+    let ClockSnapshot { clock, received_at } = snapshot;
+    if !clock.running {
+        return (clock.phase, clock.seconds);
+    }
+    let drift = received_at.elapsed().as_secs() as u32;
+    match clock.phase {
+        // MATCH counts up; STARTING/PREPARATION count down towards 0 , PAUSED
+        // never reaches here since `running` is false whenever the room is
+        // stopped.
+        ClockPhase::Match => (ClockPhase::Match, clock.seconds.saturating_add(drift)),
+        ClockPhase::Preparation if drift >= clock.seconds => (ClockPhase::Match, drift - clock.seconds),
+        phase => (phase, clock.seconds.saturating_sub(drift)),
+    }
+}
+
+/// The clock's live value right now , see [`clock_reading`].
 pub fn clock_now(snapshot: &ClockSnapshot) -> u32 {
-    if !snapshot.clock.running {
-        return snapshot.clock.seconds;
-    }
-    let drift = snapshot.received_at.elapsed().as_secs() as u32;
-    match snapshot.clock.phase {
-        // MATCH counts up; STARTING/PREPARATION count down towards 0 and stop
-        // there rather than going negative , PAUSED never reaches here since
-        // `running` is false whenever the room is stopped.
-        ClockPhase::Match => snapshot.clock.seconds.saturating_add(drift),
-        _ => snapshot.clock.seconds.saturating_sub(drift),
-    }
+    clock_reading(snapshot).1
+}
+
+/// Whether the countdown on screen has run out since the last reply.
+///
+/// When it has, the worker reports early rather than waiting for the
+/// heartbeat, so the reply that names the next phase arrives within a request
+/// of the change instead of up to a `heartbeat` after it.
+fn countdown_expired(status: &SharedIngestStatus) -> bool {
+    let status = status.read().unwrap();
+    status.clock.is_some_and(|snapshot| {
+        snapshot.clock.running
+            && matches!(snapshot.clock.phase, ClockPhase::Starting | ClockPhase::Preparation)
+            && snapshot.received_at.elapsed().as_secs_f64() >= f64::from(snapshot.clock.seconds)
+    })
 }
 
 /// What the overlay renders. Every field is set from the last response , the
@@ -614,7 +644,12 @@ fn run(
             settings.interval,
             settings.heartbeat,
         ) || undelivered_since
-            .is_some_and(|failed| failed.elapsed() >= UNDELIVERED_RETRY);
+            .is_some_and(|failed| failed.elapsed() >= UNDELIVERED_RETRY)
+            // Still spaced by `interval`, so a reply that rounds the last
+            // half-second of a countdown down to 0 costs one more request, not
+            // a burst of them.
+            || (countdown_expired(&status)
+                && last_send.is_some_and(|sent| sent.elapsed() >= settings.interval));
         if !due {
             continue;
         }
@@ -724,7 +759,7 @@ fn send_with_retry(
             }
         };
 
-        match send_once(agent, &settings.url, &body) {
+        match send_once(agent, &settings.url, &body, pin_region(&settings.url, attempt)) {
             Attempt::Accepted(resp) => {
                 log_accepted(&resp, settings);
                 let clock = resp.clock.map(|clock| ClockSnapshot {
@@ -914,13 +949,36 @@ fn build_body(
     serde_json::to_string(&Payload { token, kills })
 }
 
-fn send_once(agent: &ureq::Agent, url: &str, body: &str) -> Attempt {
-    let response = agent
+/// The Supabase region Elden Battleship's database lives in.
+///
+/// Edge functions run in the region nearest the CALLER unless told otherwise,
+/// which is backwards for this one: a report makes about ten round trips to the
+/// database and only one to the player. Run near a player in Europe or the
+/// Americas, every one of those ten crossed to Singapore and back, and a reply
+/// took 4-6 seconds (October 2026 logs: Toronto 6.2s, Zurich 4.4s, Tokyo and
+/// Mumbai, nearest the database, 2.2s). Run beside the database, only the one
+/// trip to the player is long.
+const PINNED_REGION: &str = "ap-southeast-1";
+
+/// Whether to ask for [`PINNED_REGION`]: only on a Supabase function URL, the
+/// one place the header means anything, and only on the first attempt of a
+/// send. A pinned request is never re-routed if that region is down, so every
+/// retry goes out unpinned - the worst a regional outage can cost is one
+/// attempt, after which reporting behaves exactly as it did before the pin.
+fn pin_region(url: &str, attempt: u32) -> bool {
+    attempt == 1 && url.contains(".supabase.co/functions/")
+}
+
+fn send_once(agent: &ureq::Agent, url: &str, body: &str, pinned: bool) -> Attempt {
+    let mut request = agent
         .post(url)
         .header("Content-Type", "application/json")
         // Belt and braces alongside the disabled pool: no connection is kept.
-        .header("Connection", "close")
-        .send(body);
+        .header("Connection", "close");
+    if pinned {
+        request = request.header("x-region", PINNED_REGION);
+    }
+    let response = request.send(body);
 
     let mut response = match response {
         Ok(r) => r,
@@ -1248,8 +1306,8 @@ pub fn combine_with_display_text(
 /// site's own measurement, on the site's own clock, and the split keeps it
 /// read as one thing rather than a field tacked onto a shot tally.
 fn clock_pace_line(snapshot: &ClockSnapshot, pace: Option<f64>) -> String {
-    let secs = clock_now(snapshot);
-    let label = match snapshot.clock.phase {
+    let (phase, secs) = clock_reading(snapshot);
+    let label = match phase {
         ClockPhase::Starting => "Starting",
         ClockPhase::Preparation => "Prep",
         ClockPhase::Match => "Match",
@@ -2040,6 +2098,194 @@ mod tests {
             received_at: Instant::now() - Duration::from_secs(30),
         };
         assert_eq!(clock_now(&overrun), 0);
+        assert_eq!(clock_reading(&overrun).0, ClockPhase::Starting);
+    }
+
+    /// Only the first attempt of a send is pinned, and only to Supabase, so a
+    /// regional outage costs one attempt rather than every report.
+    #[test]
+    fn region_pin_is_first_attempt_supabase_only() {
+        let supabase = "https://abc.supabase.co/functions/v1/auto-fire";
+        assert!(pin_region(supabase, 1));
+        assert!(!pin_region(supabase, 2));
+        assert!(!pin_region(supabase, MAX_ATTEMPTS));
+        assert!(!pin_region("https://example.test/report", 1));
+    }
+
+    /// A stand-in for the endpoint on 127.0.0.1: answers the Nth request with
+    /// the Nth canned reply (the last one repeats) and keeps every request's
+    /// head, lowercased, so a test can ask what was actually sent. The URL it
+    /// hands back ends in a Supabase-shaped path, so [`pin_region`] treats it as
+    /// the real thing.
+    fn fake_endpoint(replies: Vec<(u16, &'static str)>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/abc.supabase.co/functions/v1/auto-fire",
+            listener.local_addr().unwrap()
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                // The head, then however much body Content-Length says follows it.
+                let head_end = loop {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        break None;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                    if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(at + 4);
+                    }
+                };
+                let Some(head_end) = head_end else { continue };
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while raw.len() < head_end + body_len {
+                    let read = stream.read(&mut chunk).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..read]);
+                }
+                log.lock().unwrap().push(head);
+                let (status, body) = replies[n.min(replies.len() - 1)];
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    const PREP_ONE_SECOND_LEFT: &str = r#"{"ok":true,"fired":[],"skipped":[],"tally":{"hits":0,"misses":0,"shots":0,"accuracy":null,"pace":null,"sunk":0},"clock":{"phase":"preparation","seconds":1,"running":true}}"#;
+    const MATCH_JUST_STARTED: &str = r#"{"ok":true,"fired":[],"skipped":[],"tally":{"hits":0,"misses":0,"shots":0,"accuracy":null,"pace":null,"sunk":0},"clock":{"phase":"match","seconds":0,"running":true}}"#;
+
+    fn test_settings(url: String) -> IngestSettings {
+        IngestSettings {
+            url,
+            token: "0".repeat(48),
+            interval: Duration::from_secs(1),
+            heartbeat: Duration::from_secs(60),
+        }
+    }
+
+    /// End to end through the real send path: the first attempt asks for the
+    /// database's region, the server fails it, and the retry goes out WITHOUT
+    /// the header and lands. This is the guarantee that a regional outage costs
+    /// one attempt and nothing more.
+    #[test]
+    fn a_failed_pinned_attempt_retries_unpinned() {
+        let (url, seen) = fake_endpoint(vec![(503, ""), (200, MATCH_JUST_STARTED)]);
+        let (_tx, rx) = unbounded();
+        let status = create_status();
+        let settled = send_with_retry(
+            &build_agent(),
+            &test_settings(url),
+            &mut BTreeMap::new(),
+            &rx,
+            &status,
+            &Arc::new(AtomicBool::new(false)),
+        );
+
+        assert!(settled, "the retry should have been answered");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one failed attempt, one retry");
+        assert!(seen[0].contains("x-region: ap-southeast-1"), "first attempt pinned:\n{}", seen[0]);
+        assert!(!seen[1].contains("x-region"), "retry must go out unpinned:\n{}", seen[1]);
+        let status = status.read().unwrap();
+        assert!(status.eligible && !status.warn, "the retry's reply should be what is shown");
+    }
+
+    /// End to end through the real worker: a reply saying Prep has one second
+    /// left must bring the next report forward to the moment it runs out, not
+    /// leave it for the 60-second heartbeat - and that report's answer is what
+    /// moves the clock line on to Match.
+    #[test]
+    fn an_expiring_countdown_reports_early() {
+        let (url, seen) = fake_endpoint(vec![(200, PREP_ONE_SECOND_LEFT), (200, MATCH_JUST_STARTED)]);
+        let (tx, rx) = unbounded();
+        let status = create_status();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (status, stop, settings) = (Arc::clone(&status), Arc::clone(&stop), test_settings(url));
+            thread::spawn(move || run(settings, rx, status, stop))
+        };
+        // In world: the first snapshot is what lets the worker send at all.
+        tx.send(MonitorObservation {
+            active_boss_flags: Vec::new(),
+            observed_at: SystemTime::now(),
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+
+        assert!(
+            seen.lock().unwrap().len() >= 2,
+            "an expired countdown should report within seconds, not wait 60s for the heartbeat"
+        );
+        let shown = status.read().unwrap().clock.map(|c| c.clock.phase);
+        assert_eq!(shown, Some(ClockPhase::Match), "the early report's answer moves the clock on");
+    }
+
+    /// PREPARATION never sits at 0:00 waiting for a reply: it becomes MATCH
+    /// and counts up, on the line players read in game.
+    #[test]
+    fn preparation_rolls_into_match() {
+        let ending = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Preparation, seconds: 10, running: true },
+            received_at: Instant::now() - Duration::from_secs(13),
+        };
+        assert_eq!(clock_reading(&ending), (ClockPhase::Match, 3));
+        assert!(clock_pace_line(&ending, None).starts_with("Match: 0:03"));
+
+        let at_zero = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Preparation, seconds: 10, running: true },
+            received_at: Instant::now() - Duration::from_secs(10),
+        };
+        assert_eq!(clock_reading(&at_zero), (ClockPhase::Match, 0));
+
+        // A stopped prep stays exactly where it was, however long ago.
+        let paused = ClockSnapshot {
+            clock: Clock { phase: ClockPhase::Preparation, seconds: 10, running: false },
+            received_at: Instant::now() - Duration::from_secs(400),
+        };
+        assert_eq!(clock_reading(&paused), (ClockPhase::Preparation, 10));
+    }
+
+    /// A countdown that has run out asks for the next phase; one still running,
+    /// a stopped one and a MATCH clock do not.
+    #[test]
+    fn expired_countdown_asks_early() {
+        let with = |phase, seconds, running, ago| {
+            let status: SharedIngestStatus = Default::default();
+            status.write().unwrap().clock = Some(ClockSnapshot {
+                clock: Clock { phase, seconds, running },
+                received_at: Instant::now() - Duration::from_secs(ago),
+            });
+            status
+        };
+        assert!(countdown_expired(&with(ClockPhase::Starting, 5, true, 6)));
+        assert!(countdown_expired(&with(ClockPhase::Preparation, 5, true, 6)));
+        assert!(!countdown_expired(&with(ClockPhase::Preparation, 5, true, 2)));
+        assert!(!countdown_expired(&with(ClockPhase::Preparation, 5, false, 60)));
+        assert!(!countdown_expired(&with(ClockPhase::Match, 5, true, 60)));
+        assert!(!countdown_expired(&Default::default()));
     }
 
     /// Same leniency as the tally , a bad or absent `clock` must not touch
@@ -2513,6 +2759,7 @@ mod tests {
             &agent,
             &url,
             &build_body(&token, &empty).unwrap(),
+            pin_region(&url, 1),
         )) {
             "accepted" => println!("accepted"),
             "ineligible" => println!("ineligible (expected while idle)"),
@@ -2525,7 +2772,7 @@ mod tests {
         // rejection rather than something we would sit and retry.
         let bogus = build_body(&"0".repeat(48), &empty).unwrap();
         assert_eq!(
-            manual_attempt_class(&send_once(&agent, &url, &bogus)),
+            manual_attempt_class(&send_once(&agent, &url, &bogus, pin_region(&url, 1))),
             "rejected",
             "an unknown token must be a permanent rejection"
         );
